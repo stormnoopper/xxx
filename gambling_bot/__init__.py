@@ -1,0 +1,1 @@
+"""Gambling URL detection bot."""

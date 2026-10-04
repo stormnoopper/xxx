@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+out*.csv
+out*.json
+.playwright-mcp/
+# local one-off scan outputs (registry data/sites.csv is the source of truth)
+data/results*.csv
+data/candidates.txt
+scan.log

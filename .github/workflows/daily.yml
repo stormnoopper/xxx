@@ -1,0 +1,123 @@
+name: Scan & deploy
+
+# Manual only: Actions tab -> "Scan & deploy" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      discover:
+        description: "Search for new sites (uncheck = only recheck known sites)"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/daily.yml"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # Code-only pushes just rebuild the site from the committed data.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install certifi
+
+      - name: Run bot (recheck registry + discover new sites)
+        run: |
+          python -m gambling_bot update --insecure \
+            ${{ github.event_name == 'workflow_dispatch' && !inputs.discover && '--no-discover' || '' }} \
+            2> scan.log
+          tail -n 1 scan.log
+
+      - name: Job summary
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          s = json.load(open("data/summary.json"))
+          print(f"### Thailand - Blackout · {s['date']}\n")
+          print("| | |\n|---|---|")
+          for k, label in [("checked", "URL ที่ตรวจ"), ("new", "พบใหม่"), ("closed_today", "ปิดวันนี้"),
+                           ("reopened", "กลับมาเปิด"), ("failing", "ตรวจไม่พบครั้งแรก (รอยืนยัน)"),
+                           ("total_active", "เปิดอยู่ทั้งหมด"), ("total_closed", "ปิดแล้วทั้งหมด")]:
+              print(f"| {label} | {s.get(k, 0):,} |")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-log
+          path: scan.log
+          retention-days: 14
+
+      - name: Commit updated registry
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/sites.csv data/summary.json
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          msg=$(python -c "import json;s=json.load(open('data/summary.json'));print(f\"data: {s['date']} active {s['total_active']} (+{s['new']} new, {s['closed_today']} closed, {s['reopened']} reopened)\")")
+          git commit -m "$msg"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  build:
+    needs: scan
+    # Run after a successful scan, or on its own for code-only pushes.
+    if: always() && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }} # pick up the registry commit pushed by the scan job
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build static site
+        working-directory: web
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
